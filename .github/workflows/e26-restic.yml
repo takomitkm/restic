@@ -1,0 +1,84 @@
+name: e26-restic-cost
+
+# E26b: real restic, three local_windows.go variants, dir-flush cost.
+# base    = restic/restic 74f00280 (upstream master, fsyncDir is a no-op)
+# dironly = takomitkm/restic f61eb4fa (PR #22177 commit 1, parent-dir flush)
+# dirroot = takomitkm/restic 84e6a8cc (PR #22177 head, + volume-root flush)
+# fsyncDir fires once per saved file (after the temp-file rename), so the
+# workload = init + 40 small backups; each snapshot saves pack + lock files.
+
+on:
+  push:
+    branches: [bench-e26]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: rig
+        uses: actions/checkout@v4
+        with:
+          path: rig
+
+      - name: base (upstream master)
+        uses: actions/checkout@v4
+        with:
+          repository: restic/restic
+          ref: 74f00280e21a67b6dd80de7a6b4a79db3b2770e5
+          path: base
+
+      - name: dironly (PR #22177 commit 1)
+        uses: actions/checkout@v4
+        with:
+          repository: takomitkm/restic
+          ref: f61eb4fa9810f87948c82beb8b60ba2a2430fe1b
+          path: dironly
+
+      - name: dirroot (PR #22177 head)
+        uses: actions/checkout@v4
+        with:
+          repository: takomitkm/restic
+          ref: 84e6a8cc88615fcaaa2181d96ecd5c50a9714616
+          path: dirroot
+
+      - name: build three restic binaries
+        shell: pwsh
+        run: |
+          go version
+          foreach ($v in 'base','dironly','dirroot') {
+            Push-Location $v
+            go build -trimpath -o "..\e26-$v.exe" ./cmd/restic
+            $c = $LASTEXITCODE
+            Pop-Location
+            if ($c -ne 0) { exit $c }
+          }
+
+      - name: bench - 3 rounds x 3 variants (init + 40 backups each)
+        shell: pwsh
+        run: |
+          $env:RESTIC_PASSWORD = 'e26pw'
+          $src = 'D:\e26src'
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          if (-not (Test-Path "$src\f000.bin")) {
+            foreach ($i in 0..19) {
+              $b = New-Object byte[] 16384
+              (New-Object Random($i)).NextBytes($b)
+              [IO.File]::WriteAllBytes("$src\f{0:d3}.bin" -f $i, $b)
+            }
+          }
+          foreach ($r in 1..3) {
+            foreach ($v in 'base','dironly','dirroot') {
+              $repo = "D:\e26restic-$v-$r"
+              $sw = [Diagnostics.Stopwatch]::StartNew()
+              & ".\e26-$v.exe" -r $repo init --quiet
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              foreach ($b in 1..40) {
+                & ".\e26-$v.exe" -r $repo backup $src --quiet
+                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              }
+              $sw.Stop()
+              '{0} round{1}: {2:N1} s total ({3} backups + init)' -f $v, $r, $sw.Elapsed.TotalSeconds, 40
+            }
+          }
